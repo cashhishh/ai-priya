@@ -14,9 +14,9 @@
  *  - initial-connect retry with the other API version (SDK/docs mismatch)
  */
 import { GoogleGenAI, Modality, type LiveConnectConfig, type LiveServerMessage, type Session } from "@google/genai";
-import { CALL_CONNECTED_CUE, buildSystemPrompt } from "@/lib/prompts";
+import { CALL_CONNECTED_CUE, SELLER_SAID_HELLO_CUE, buildSystemPrompt } from "@/lib/prompts";
 import { applyEventToContext } from "@/lib/tools/context";
-import { LIVE_FUNCTION_DECLARATIONS, liveScheduling } from "@/lib/tools/declarations";
+import { LIVE_FUNCTION_DECLARATIONS } from "@/lib/tools/declarations";
 import { executeTool, traceStatus } from "@/lib/tools/executor";
 import type { AudioLevels, SessionHandlers, VoiceSession } from "@/lib/voice/types";
 import { errorFromUnknown } from "@/lib/voice/types";
@@ -42,6 +42,14 @@ const THINKING_DELAY_MS = 700;
 const END_CALL_SAFETY_MS = 20_000;
 /** Seller transcription arriving this soon after end_call_summary is the tail of their previous words. */
 const LATE_TRANSCRIPT_GRACE_MS = 1_500;
+/** Pre-connect mic buffer: up to 8 s of 40 ms chunks. */
+const PRE_CONNECT_MAX_CHUNKS = 200;
+/** A 40 ms chunk this loud counts as speech (silence after noise suppression is ~0.005). */
+const SPEECH_RMS = 0.03;
+/** ≥ 200 ms of speech = the seller said something while we were connecting. */
+const SPEECH_MIN_CHUNKS = 5;
+/** If the replayed "hello" gets no reply in this long, send the connect cue anyway. */
+const GREET_SAFETY_MS = 2_500;
 
 /**
  * Hang-up state after end_call_summary:
@@ -50,6 +58,64 @@ const LATE_TRANSCRIPT_GRACE_MS = 1_500;
  * If the seller speaks again, go back to idle and keep the call open.
  */
 type EndPhase = "idle" | "awaiting_goodbye" | "goodbye_playing";
+
+/**
+ * Dev-only turn log. If a turn gets no reply, the console shows where it
+ * stopped: seller turn → model turn started → audio chunks → turnComplete.
+ */
+const DEBUG = process.env.NODE_ENV !== "production";
+
+class TurnLog {
+  private turn = 0;
+  private sellerOpen = false;
+  private modelOpen = false;
+  private chunks = 0;
+  private start = 0;
+
+  private log(msg: string): void {
+    if (DEBUG) console.log(`[live #${this.turn}] ${msg}`);
+  }
+  seller(text: string): void {
+    if (!this.sellerOpen) {
+      this.sellerOpen = true;
+      this.turn++;
+      this.start = Date.now();
+      this.log("seller turn received");
+    }
+    this.log(`  seller: "${text.trim()}"`);
+  }
+  modelAudio(): void {
+    if (!this.modelOpen) {
+      this.modelOpen = true;
+      this.chunks = 0;
+      this.log(`model turn started (+${this.start ? Date.now() - this.start : 0}ms after seller)`);
+    }
+    this.chunks++;
+  }
+  modelText(text: string): void {
+    if (!this.modelOpen) this.log("model transcript arrived before any audio");
+    this.log(`  priya: "${text.trim()}"`);
+  }
+  tool(name: string, status: string, detail?: string): void {
+    this.log(`tool ${name} → ${status}${detail ? `: ${detail}` : ""}`);
+  }
+  interrupted(): void {
+    this.log(`interrupted (barge-in) after ${this.chunks} audio chunks`);
+    this.modelOpen = false;
+  }
+  generationComplete(): void {
+    this.log(`generationComplete (${this.chunks} audio chunks so far)`);
+  }
+  turnComplete(): void {
+    this.log(this.modelOpen ? `turnComplete: ${this.chunks} audio chunks` : "turnComplete with NO model audio in this turn");
+    this.modelOpen = false;
+    this.sellerOpen = false;
+    this.chunks = 0;
+  }
+  note(msg: string): void {
+    this.log(msg);
+  }
+}
 
 class TokenError extends Error {
   constructor(message: string, readonly missingKey: boolean) {
@@ -86,16 +152,69 @@ export class LiveSession implements VoiceSession {
   private endSafetyTimer: ReturnType<typeof setTimeout> | null = null;
   private thinkingTimer: ReturnType<typeof setTimeout> | null = null;
   private botTurnOpen = false;
-  /** Set when a guard said "wait for the seller": drop Priya's output until the seller speaks. */
-  private mutedUntilSeller = false;
+  private turnLog = new TurnLog();
+
+  /**
+   * Mic audio captured BEFORE the first setupComplete (token fetch + connect
+   * takes 1-3 s). It used to be dropped, so a "hello" said right after
+   * pressing Call never reached Gemini. Now it is kept and replayed.
+   */
+  private preConnect: string[] = [];
+  private preConnectSpeechChunks = 0;
+  private greetTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly h: SessionHandlers) {
-    this.capture = new AudioCapture((data) => {
+    this.capture = new AudioCapture((data, rms) => {
       // Stream mic continuously; Gemini's server-side VAD decides turns and barge-in.
       if (this.session && this.setupComplete && !this.reconnecting) {
         this.session.sendRealtimeInput({ audio: { data, mimeType: "audio/pcm;rate=16000" } });
+      } else if (!this.everConnected) {
+        this.preConnect.push(data);
+        if (this.preConnect.length > PRE_CONNECT_MAX_CHUNKS) this.preConnect.shift();
+        if (rms >= SPEECH_RMS) this.preConnectSpeechChunks++;
       }
     });
+  }
+
+  /**
+   * First setupComplete: start the conversation.
+   *  - Seller already spoke while connecting (inbound call): replay their audio
+   *    so Gemini hears the "hello" (it shows in the transcript) and answers it.
+   *    If nothing comes back within GREET_SAFETY_MS, fall back to the cue.
+   *  - Otherwise (or proactive / follow-up calls, which must run a tool first):
+   *    send the [CALL_CONNECTED] cue so Priya speaks first.
+   */
+  private startConversation(): void {
+    const spoke = this.preConnectSpeechChunks >= SPEECH_MIN_CHUNKS;
+    const buffered = this.preConnect;
+    this.preConnect = [];
+    const mode = this.h.getContext().mode;
+    if (spoke && mode === "inbound") {
+      this.turnLog.note(`seller spoke while connecting: replaying ${buffered.length} buffered chunks (~${buffered.length * 40}ms)`);
+      for (const data of buffered) this.session?.sendRealtimeInput({ audio: { data, mimeType: "audio/pcm;rate=16000" } });
+      this.greetTimer = setTimeout(() => {
+        this.greetTimer = null;
+        if (this.stopped) return;
+        this.turnLog.note("no reply to the replayed audio; sending CALL_CONNECTED cue");
+        this.sendConnectedCue(true);
+      }, GREET_SAFETY_MS);
+      return;
+    }
+    this.sendConnectedCue(spoke);
+  }
+
+  private sendConnectedCue(sellerAlreadySpoke: boolean): void {
+    // The "phone system" tells Priya the call is live, so she speaks first.
+    const text = sellerAlreadySpoke ? `${CALL_CONNECTED_CUE} ${SELLER_SAID_HELLO_CUE}` : CALL_CONNECTED_CUE;
+    this.session?.sendClientContent({ turns: [{ role: "user", parts: [{ text }] }], turnComplete: true });
+    this.turnLog.note(`sent ${text}`);
+    this.h.onStatus("thinking");
+  }
+
+  /** Anything from the server that shows the conversation has started cancels the fallback cue. */
+  private cancelGreetFallback(): void {
+    if (this.greetTimer) clearTimeout(this.greetTimer);
+    this.greetTimer = null;
   }
 
   async start(): Promise<void> {
@@ -253,9 +372,8 @@ export class LiveSession implements VoiceSession {
       if (!this.everConnected) {
         this.everConnected = true;
         this.h.onStatus("listening");
-        // The "phone system" tells Priya the call is live, so she speaks first.
-        this.session?.sendClientContent({ turns: [{ role: "user", parts: [{ text: CALL_CONNECTED_CUE }] }], turnComplete: true });
-        this.h.onStatus("thinking");
+        this.turnLog.note(`setupComplete (${this.preConnect.length} chunks buffered while connecting, ${this.preConnectSpeechChunks} with speech)`);
+        this.startConversation();
       } else if (isResume) {
         this.reconnects = 0;
         this.h.onStatus(this.player.isPlaying ? "speaking" : "listening");
@@ -267,23 +385,29 @@ export class LiveSession implements VoiceSession {
     }
 
     if (msg.goAway) {
+      this.turnLog.note("goAway: reconnecting with the resumption handle");
       // Server will close soon: reconnect proactively with the resumption handle.
       this.session?.close();
     }
 
-    if (msg.toolCall?.functionCalls?.length) this.handleToolCall(msg);
+    if (msg.toolCall?.functionCalls?.length) {
+      this.turnLog.note(`toolCall: ${msg.toolCall.functionCalls.map((f) => f.name).join(", ")}`);
+      this.handleToolCall(msg);
+    }
 
     if (msg.toolCallCancellation?.ids) {
       for (const id of msg.toolCallCancellation.ids) {
+        this.turnLog.tool(id, "cancelled");
         this.h.onToolTrace({ id, name: "", args: {}, status: "cancelled", started_at: Date.now() });
       }
     }
 
     const sc = msg.serverContent;
     if (!sc) return;
+    if (this.greetTimer && (sc.inputTranscription?.text || sc.modelTurn?.parts?.length)) this.cancelGreetFallback();
 
     if (sc.interrupted) {
-      this.mutedUntilSeller = false; // the server heard the seller
+      this.turnLog.interrupted();
       // BARGE-IN: the seller started talking, so stop Priya instantly.
       this.player.flush();
       this.botTurnOpen = false;
@@ -295,7 +419,7 @@ export class LiveSession implements VoiceSession {
       this.h.onTranscript({ kind: "seller_interim", text: sc.interimInputTranscription.text });
     }
     if (sc.inputTranscription?.text) {
-      if (/[\p{L}\p{N}]{2,}/u.test(sc.inputTranscription.text)) this.mutedUntilSeller = false;
+      this.turnLog.seller(sc.inputTranscription.text);
       this.h.onTranscript({ kind: "seller_delta", text: sc.inputTranscription.text });
       this.scheduleThinking();
       // The seller is talking again after the summary: don't hang up on them.
@@ -305,8 +429,8 @@ export class LiveSession implements VoiceSession {
     }
 
     for (const part of sc.modelTurn?.parts ?? []) {
-      if (this.mutedUntilSeller) break; // Priya would be answering her own question
       if (part.inlineData?.data && part.inlineData.mimeType?.startsWith("audio/")) {
+        this.turnLog.modelAudio();
         this.player.enqueue(part.inlineData.data);
         if (this.endPhase === "awaiting_goodbye") this.endPhase = "goodbye_playing";
         if (!this.botTurnOpen) {
@@ -317,11 +441,15 @@ export class LiveSession implements VoiceSession {
       }
     }
 
-    if (sc.outputTranscription?.text && !this.mutedUntilSeller) {
+    if (sc.outputTranscription?.text) {
+      this.turnLog.modelText(sc.outputTranscription.text);
       this.h.onTranscript({ kind: "priya_delta", text: sc.outputTranscription.text });
     }
 
+    if (sc.generationComplete) this.turnLog.generationComplete();
+
     if (sc.turnComplete) {
+      this.turnLog.turnComplete();
       this.botTurnOpen = false;
       this.h.onTranscript({ kind: "turn_complete" });
       // Only the turn that carried the goodbye audio ends the call; a turnComplete
@@ -345,7 +473,6 @@ export class LiveSession implements VoiceSession {
     this.h.onStatus("thinking");
     // Local context copy so several calls in one batch see each other's effects.
     let ctx = this.h.getContext();
-    let awaitSeller = false;
     const functionResponses = (msg.toolCall?.functionCalls ?? []).map((fc) => {
       const id = fc.id ?? `${fc.name}_${Date.now()}`;
       const started = Date.now();
@@ -366,18 +493,14 @@ export class LiveSession implements VoiceSession {
         started_at: started,
         duration_ms: Date.now() - started,
       });
-      if (exec.response.await_seller === true) awaitSeller = true;
-      // SILENT: add the result to context without making Priya speak again.
-      // (Set both as the SDK field and inside `response`, as the Live docs show.)
-      const scheduling = liveScheduling(fc.name);
-      return scheduling
-        ? { id: fc.id, name: fc.name, scheduling, response: { ...exec.response, scheduling } }
-        : { id: fc.id, name: fc.name, response: exec.response };
+      const status = traceStatus(exec.response);
+      this.turnLog.tool(fc.name ?? "unknown", status, status === "blocked" ? String(exec.response.reason ?? "") : exec.resultLine);
+      // Plain BLOCKING response with default scheduling, refusals included:
+      // the model reads it and carries on (or waits for the seller) by itself.
+      return { id: fc.id, name: fc.name, response: exec.response };
     });
+    this.turnLog.note(`sent ${functionResponses.length} tool response(s)`);
     this.session?.sendToolResponse({ functionResponses });
-    // A guard said "wait for the seller": mute whatever Priya generates next
-    // until the seller actually speaks, so she can't answer her own question.
-    if (awaitSeller) this.muteUntilSellerSpeaks();
   }
 
   /** After end_call_summary, hang up once Priya's goodbye has finished playing. */
@@ -392,18 +515,6 @@ export class LiveSession implements VoiceSession {
         if (!this.stopped && this.endPhase !== "idle") this.h.onCallShouldEnd();
       });
     }, END_CALL_SAFETY_MS);
-  }
-
-  /**
-   * Priya asked a question and then tried to act as if the seller had answered.
-   * The guard refused; the model will still generate a reply to that refusal,
-   * so drop it. Whatever she already said (the question) keeps playing.
-   */
-  private muteUntilSellerSpeaks(): void {
-    this.mutedUntilSeller = true;
-    void this.player.whenDrained().then(() => {
-      if (!this.stopped && this.mutedUntilSeller) this.h.onStatus("listening");
-    });
   }
 
   private disarmEndOfCall(): void {
@@ -427,6 +538,7 @@ export class LiveSession implements VoiceSession {
   private teardown(): void {
     this.stopped = true;
     this.clearThinking();
+    this.cancelGreetFallback();
     if (this.endSafetyTimer) clearTimeout(this.endSafetyTimer);
     try {
       this.session?.close();

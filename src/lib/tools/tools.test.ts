@@ -3,7 +3,7 @@ import type { GoogleGenAI } from "@google/genai";
 import { applyTranscriptOp, callReducer, initialCallState, joinChunks, type TranscriptEntry } from "@/lib/call-state";
 import { cleanForSpeech, runChatTurn } from "@/lib/fallback/chat-loop";
 import { applyEventToContext } from "@/lib/tools/context";
-import { FUNCTION_DECLARATIONS, LIVE_FUNCTION_DECLARATIONS, TOOL_NAMES, liveScheduling } from "@/lib/tools/declarations";
+import { FUNCTION_DECLARATIONS, LIVE_FUNCTION_DECLARATIONS, TOOL_NAMES } from "@/lib/tools/declarations";
 import { executeTool, normalizeDate, traceStatus } from "@/lib/tools/executor";
 import { classifyConsent } from "@/lib/tools/guards";
 import { buildSummary } from "@/lib/tools/summary";
@@ -42,14 +42,9 @@ const propose = (c: CallContext, action_type: string, title = "Action") =>
   run(c, "propose_action", { title, why: "x", expected_recovery_inr: 999999, owner: "seller", due_date: "2026-11-20", action_type });
 
 describe("tool declarations", () => {
-  it("declares all 9 tools; Live: bookkeeping tools NON_BLOCKING (+SILENT), the rest BLOCKING; fallback has no behavior", () => {
+  it("declares all 9 tools; Live: every tool BLOCKING; fallback has no behavior", () => {
     expect(FUNCTION_DECLARATIONS.map((d) => d.name)).toEqual([...TOOL_NAMES]);
-    const behavior = Object.fromEntries(LIVE_FUNCTION_DECLARATIONS.map((d) => [d.name, d.behavior]));
-    expect(behavior.record_seller_insight).toBe("NON_BLOCKING");
-    expect(behavior.propose_action).toBe("NON_BLOCKING");
-    for (const n of ["run_diagnosis", "get_product_breakdown", "execute_mock_action", "schedule_follow_up", "end_call_summary"]) expect(behavior[n], n).toBe("BLOCKING");
-    expect(liveScheduling("record_seller_insight")).toBe("SILENT");
-    expect(liveScheduling("run_diagnosis")).toBeUndefined();
+    expect(LIVE_FUNCTION_DECLARATIONS.every((d) => d.behavior === "BLOCKING")).toBe(true);
     expect(FUNCTION_DECLARATIONS.every((d) => d.behavior === undefined)).toBe(true);
   });
 });

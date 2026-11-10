@@ -12,7 +12,7 @@ export class AudioCapture {
   private level = 0;
   private muted = false;
 
-  constructor(private readonly onChunk: (base64Pcm: string) => void) {}
+  constructor(private readonly onChunk: (base64Pcm: string, rms: number) => void) {}
 
   static isSupported(): boolean {
     return typeof window !== "undefined" && typeof AudioWorkletNode !== "undefined" && !!navigator.mediaDevices?.getUserMedia;
@@ -26,7 +26,7 @@ export class AudioCapture {
     this.node = new AudioWorkletNode(this.ctx, "pcm-capture", { processorOptions: { targetRate: 16000 } });
     this.node.port.onmessage = (e: MessageEvent<{ pcm: ArrayBuffer; rms: number }>) => {
       this.level = this.level * 0.5 + Math.min(1, e.data.rms * 6) * 0.5;
-      if (!this.muted) this.onChunk(arrayBufferToBase64(e.data.pcm));
+      if (!this.muted) this.onChunk(arrayBufferToBase64(e.data.pcm), e.data.rms);
     };
     // Worklet must be connected to be pulled; it outputs silence so nothing is heard.
     source.connect(this.node);

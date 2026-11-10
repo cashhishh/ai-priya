@@ -47,6 +47,7 @@ describe("system cues never reach the transcript", () => {
   it("strips cues, including one split across chunks or half-streamed", () => {
     expect(stripCues("[CALL_CONNECTED] Namaste Ramesh ji!")).toBe("Namaste Ramesh ji!");
     expect(stripCues("Namaste [CALL_CONN")).toBe("Namaste");
+    expect(stripCues("[CALL_CONNECTED] [SELLER_ALREADY_SAID_HELLO] Hello ji!")).toBe("Hello ji!");
     expect(stripCues("Price [approx] hai")).toBe("Price [approx] hai"); // only UPPERCASE cues
 
     let t: TranscriptEntry[] = [];
@@ -71,10 +72,10 @@ describe("Priya never answers her own question", () => {
     [{ kind: "priya_delta", text: "Ho gaya. Kya hum agle Tuesday follow-up call kar sakte hain?" }, 2],
   ]);
 
-  it("blocks schedule_follow_up until the seller answers, and asks the engine to mute Priya", () => {
+  it("blocks schedule_follow_up until the seller answers (plain refusal, no mute)", () => {
     const { r, ctx } = run({ ...ready(), signals: askedTuesday }, "schedule_follow_up", { when: "next Tuesday", purpose: "Check" });
     expect(traceStatus(r.response)).toBe("blocked");
-    expect(r.response.await_seller).toBe(true);
+    expect(r.response.await_seller).toBeUndefined();
     expect(String(r.response.reason)).toMatch(/Never answer your own question/);
     expect(ctx.follow_up).toBeNull();
   });
@@ -100,7 +101,7 @@ describe("Priya never answers her own question", () => {
       [{ kind: "priya_delta", text: "Main restock list ready kar doon?" }, 2],
     ]);
     const r = run({ ...c, signals: pending }, "execute_mock_action", { type: "generate_restock_list", seller_consent_quote: "haan" }).r;
-    expect(r.response.await_seller).toBe(true);
+    expect(traceStatus(r.response)).toBe("blocked");
 
     const yesThenQuestion = sig([
       [{ kind: "seller_delta", text: "haan kar do" }, 1],

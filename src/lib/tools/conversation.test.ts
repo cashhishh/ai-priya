@@ -225,7 +225,7 @@ describe("wrap-up: never end in the same turn as 'kuch aur help chahiye?'", () =
     const r = run(sameTurn, "end_call_summary", END_ARGS).r;
     expect(traceStatus(r.response)).toBe("blocked");
     expect(String(r.response.reason)).toMatch(/NOT answered yet/);
-    expect(r.response.await_seller).toBe(true);
+    expect(r.response.await_seller).toBeUndefined(); // plain tool response, no muting
 
     const answered = { ...sameTurn, signals: updateSignals(sameTurn.signals, { kind: "seller_delta", text: "nahi bas, thank you" }, 3) };
     expect(traceStatus(run(answered, "end_call_summary", END_ARGS).r.response)).toBe("done");

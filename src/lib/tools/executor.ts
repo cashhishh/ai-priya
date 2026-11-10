@@ -38,14 +38,14 @@ export function traceStatus(response: Record<string, unknown>): "done" | "error"
   return "error" in response ? "error" : "done";
 }
 
-const blocked = (reason: string, events: UiEvent[] = [], awaitSeller = false): ToolExecution => ({
-  // await_seller tells the Live engine to mute Priya until the seller speaks.
-  response: { ok: false, blocked: true, reason, ...(awaitSeller ? { await_seller: true } : {}) },
+const blocked = (reason: string, events: UiEvent[] = []): ToolExecution => ({
+  // A refusal is a normal tool response: the model reads the reason and carries on.
+  response: { ok: false, blocked: true, reason },
   events,
   resultLine: `blocked by guardrail: ${reason}`,
 });
 
-const blockedAwaiting = (g: { reason: string }) => blocked(g.reason, [], true);
+const blockedAwaiting = (g: { reason: string }) => blocked(g.reason);
 
 /** Tool results trigger a new model response; this stops Priya taking a second turn. */
 const NO_DOUBLE_TURN =
@@ -378,7 +378,7 @@ const HANDLERS: Record<ToolName, (args: Args, ctx: CallContext) => ToolExecution
     const waiting = guardAwaitingSeller(ctx, "end");
     if (waiting) return blockedAwaiting(waiting);
     const guard = guardEndCall(ctx, args.seller_declined_more_help === true, args.follow_up_declined === true);
-    if (guard) return blocked(guard.reason, [], guard.reason.includes("has NOT answered"));
+    if (guard) return blocked(guard.reason);
     const summary = buildSummary({
       issues: strArr(args, "issues"),
       modelActions: strArr(args, "actions"),

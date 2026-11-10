@@ -5,7 +5,7 @@
  *
  * One source of truth → the agent behaves the same whichever engine runs.
  */
-import { Behavior, FunctionResponseScheduling, Type, type FunctionDeclaration } from "@google/genai";
+import { Behavior, Type, type FunctionDeclaration } from "@google/genai";
 import { ACTION_TYPES } from "@/lib/types";
 
 export const TOOL_NAMES = [
@@ -168,27 +168,12 @@ export const FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
 ];
 
 /**
- * Bookkeeping tools: Priya doesn't need their result to keep talking, and a
- * tool response would otherwise make the model start a NEW turn (in a real
- * call she answered her own question that way). In Live mode they run
- * NON_BLOCKING and their responses are sent with scheduling SILENT: the
- * result is added to context without triggering speech.
- */
-export const SILENT_TOOLS: ReadonlySet<string> = new Set<ToolName>(["record_seller_insight", "propose_action"]);
-
-/** Scheduling for a Live function response (only applies to NON_BLOCKING tools). */
-export function liveScheduling(name: string | undefined): FunctionResponseScheduling | undefined {
-  return name && SILENT_TOOLS.has(name) ? FunctionResponseScheduling.SILENT : undefined;
-}
-
-/**
- * Live-mode declarations (gemini-3.8-live supports sync and async calls).
- * Data and action tools stay BLOCKING so Priya waits for the result (e.g. the
- * diagnosis) before speaking about it; bookkeeping tools are NON_BLOCKING +
- * SILENT. `behavior` is only accepted by the Live API, so the fallback uses
- * the plain list.
+ * Live-mode declarations: every tool is BLOCKING and every response uses the
+ * default scheduling. (NON_BLOCKING + SILENT responses for the bookkeeping
+ * tools made Priya skip replies in real calls, so they were removed.)
+ * `behavior` is only accepted by the Live API, so the fallback uses the plain list.
  */
 export const LIVE_FUNCTION_DECLARATIONS: FunctionDeclaration[] = FUNCTION_DECLARATIONS.map((d) => ({
   ...d,
-  behavior: d.name && SILENT_TOOLS.has(d.name) ? Behavior.NON_BLOCKING : Behavior.BLOCKING,
+  behavior: Behavior.BLOCKING,
 }));

@@ -120,6 +120,7 @@ const GUARDRAILS = `
 const CUE_RULES = `
 # SYSTEM CUES
 Messages in square brackets like [CALL_CONNECTED] come from the phone system, not the seller. Follow them silently. NEVER say, repeat or echo anything in square brackets; your first spoken words are simply the greeting.
+[SELLER_ALREADY_SAID_HELLO] means the seller already said hello while the line was connecting: greet them right away, as a reply to their hello. If the seller says hello (or anything) before you have greeted them, reply immediately with your greeting; never stay silent.
 `;
 
 function todayBlock(nowIso: string): string {
@@ -209,3 +210,5 @@ export function buildSystemPrompt({ mode, memory, nowIso }: PromptOptions): stri
 
 /** The first message the "phone system" sends when the call connects. */
 export const CALL_CONNECTED_CUE = "[CALL_CONNECTED]";
+/** Added to the connect cue when the seller already spoke while the line was connecting. */
+export const SELLER_SAID_HELLO_CUE = "[SELLER_ALREADY_SAID_HELLO]";
